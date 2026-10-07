@@ -149,12 +149,23 @@ jobs:
             exit 1
           fi
 
+          avb_tools="$RUNNER_TEMP/aosp-avb"
+          git init --quiet "$avb_tools"
+          git -C "$avb_tools" remote add origin https://android.googlesource.com/platform/external/avb
+          git -C "$avb_tools" fetch --depth=1 origin 5ace2cf8e07d0807f6e92f649b400f1bd473e1ed
+          git -C "$avb_tools" checkout --quiet --detach FETCH_HEAD
+          if [[ "$(git -C "$avb_tools" rev-parse HEAD)" != "5ace2cf8e07d0807f6e92f649b400f1bd473e1ed" ]]; then
+            echo "::error::Fetched an unexpected AOSP avbtool revision."
+            exit 1
+          fi
+
           mkdir -p "$RUNNER_TEMP/work" "$RUNNER_TEMP/output"
           export BASE_IMAGE="$base_image"
           export KERNEL_IMAGE="$kernel"
           export KERNEL_DTB="$kernel_dtb"
           export WORK_DIR="$RUNNER_TEMP/work"
           export TOOLS_DIR="$tools"
+          export AVB_TOOL="$avb_tools/avbtool"
           export OUTPUT_DIR="$RUNNER_TEMP/output"
           python3 - <<'PY'
           import filecmp
@@ -173,6 +184,7 @@ jobs:
           output_dir = pathlib.Path(os.environ["OUTPUT_DIR"])
           unpacker = tools_dir / "unpack_bootimg.py"
           mkbootimg = tools_dir / "mkbootimg.py"
+          avbtool = pathlib.Path(os.environ["AVB_TOOL"])
           base_dir = work_dir / "base"
           base_dir.mkdir(parents=True, exist_ok=True)
 
@@ -215,15 +227,29 @@ jobs:
           image_name = (
               f"OrangeFox-CustomKernel-evergo-{os.environ['KERNEL_SHA'][:12]}-"
               f"{os.environ['FOX_SHA'][:12]}-boot.img")
-          output_image = output_dir / image_name
+          # avbtool resolves the boot hash descriptor to a sibling boot.img.
+          output_image = output_dir / "boot.img"
           args.extend(["--output", str(output_image)])
           subprocess.run([sys.executable, str(mkbootimg), *args], check=True)
 
           partition_size = base_image.stat().st_size
           if output_image.stat().st_size > partition_size:
               raise SystemExit("Repacked boot image exceeds the OrangeFox image size.")
-          with output_image.open("r+b") as image_file:
-              image_file.truncate(partition_size)
+          # Unlocked LK still requires valid AVB metadata to load the boot image.
+          # mkbootimg drops the source footer; padding alone leaves hdr_loaded unset.
+          subprocess.run(
+              [sys.executable, str(avbtool), "add_hash_footer",
+               "--image", str(output_image),
+               "--partition_size", str(partition_size),
+               "--partition_name", "boot", "--hash_algorithm", "sha256",
+               "--algorithm", "NONE"],
+              check=True)
+          if output_image.stat().st_size != partition_size:
+              raise SystemExit("AVB boot image does not match the partition size.")
+          subprocess.run(
+              [sys.executable, str(avbtool), "verify_image",
+               "--image", str(output_image)],
+              check=True)
 
           verify_dir = work_dir / "verify"
           subprocess.run(
@@ -238,6 +264,8 @@ jobs:
           for name, actual, expected in components:
               if not filecmp.cmp(actual, expected, shallow=False):
                   raise SystemExit(f"Repacked {name} does not match its source.")
+
+          output_image = output_image.rename(output_dir / image_name)
 
           digest = hashlib.sha256()
           with output_image.open("rb") as image_file:
@@ -255,6 +283,8 @@ jobs:
               summary.write(f"- Kernel run: `{os.environ['KERNEL_SHA']}`\n")
               summary.write(f"- OrangeFox run: `{os.environ['FOX_SHA']}`\n")
               summary.write(f"- Output: `{image_name}` ({partition_size} bytes)\n")
+              summary.write("- AVB: regenerated unsigned `boot` hash footer; "
+                            "footer and payload SHA-256 verified.\n")
               summary.write(f"- SHA-256: `{sha256}`\n")
           PY
 

@@ -1,0 +1,246 @@
+name: Package latest evergo boot image
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: Package kernel + OrangeFox boot image
+    runs-on: self-hosted
+    timeout-minutes: 30
+    steps:
+      - name: Select latest successful upstream runs
+        id: select
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.SOURCE_ARTIFACTS_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$GITHUB_REF" != "refs/heads/main" ]]; then
+            echo "::error::Run this workflow from the main branch."
+            exit 1
+          fi
+          if [[ -z "${GH_TOKEN:-}" ]]; then
+            echo "::error::Configure SOURCE_ARTIFACTS_TOKEN with Actions: read on both source repositories."
+            exit 1
+          fi
+          command -v gh >/dev/null
+          command -v jq >/dev/null
+
+          kernel_runs=$(gh run list \
+            --repo MEvergo/evergo-aqua-v34-port \
+            --workflow 375622165 \
+            --branch main \
+            --status success \
+            --limit 1 \
+            --json databaseId,headSha)
+          fox_runs=$(gh run list \
+            --repo MEvergo/orangefox-evergo \
+            --workflow 376503173 \
+            --branch main \
+            --status success \
+            --limit 1 \
+            --json databaseId,headSha)
+
+          if [[ "$(jq 'length' <<< "$kernel_runs")" -eq 0 ]]; then
+            echo "::error::No successful Kernel build run found on main."
+            exit 1
+          fi
+          if [[ "$(jq 'length' <<< "$fox_runs")" -eq 0 ]]; then
+            echo "::error::No successful OrangeFox build run found on main."
+            exit 1
+          fi
+
+          kernel_run_id=$(jq -er '.[0].databaseId' <<< "$kernel_runs")
+          kernel_sha=$(jq -er '.[0].headSha' <<< "$kernel_runs")
+          fox_run_id=$(jq -er '.[0].databaseId' <<< "$fox_runs")
+          fox_sha=$(jq -er '.[0].headSha' <<< "$fox_runs")
+
+          [[ "$kernel_run_id" =~ ^[0-9]+$ ]]
+          [[ "$fox_run_id" =~ ^[0-9]+$ ]]
+          [[ "$kernel_sha" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$fox_sha" =~ ^[0-9a-f]{40}$ ]]
+
+          {
+            echo "kernel_run_id=$kernel_run_id"
+            echo "kernel_sha=$kernel_sha"
+            echo "fox_run_id=$fox_run_id"
+            echo "fox_sha=$fox_sha"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Download selected upstream artifacts
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.SOURCE_ARTIFACTS_TOKEN }}
+          KERNEL_RUN_ID: ${{ steps.select.outputs.kernel_run_id }}
+          KERNEL_SHA: ${{ steps.select.outputs.kernel_sha }}
+          FOX_RUN_ID: ${{ steps.select.outputs.fox_run_id }}
+          FOX_SHA: ${{ steps.select.outputs.fox_sha }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/kernel" "$RUNNER_TEMP/orangefox"
+
+          gh run download "$KERNEL_RUN_ID" \
+            --repo MEvergo/evergo-aqua-v34-port \
+            --name "evergo-kernel-$KERNEL_SHA" \
+            --dir "$RUNNER_TEMP/kernel"
+          gh run download "$FOX_RUN_ID" \
+            --repo MEvergo/orangefox-evergo \
+            --name "orangefox-evergo-$FOX_SHA" \
+            --dir "$RUNNER_TEMP/orangefox"
+
+      - name: Repack and verify boot image
+        id: package_image
+        shell: bash
+        env:
+          KERNEL_SHA: ${{ steps.select.outputs.kernel_sha }}
+          FOX_SHA: ${{ steps.select.outputs.fox_sha }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          kernel="$RUNNER_TEMP/kernel/arch/arm64/boot/Image.gz"
+          kernel_dtb="$RUNNER_TEMP/kernel/arch/arm64/boot/dts/mediatek/mt6833.dtb"
+          fox_images=("$RUNNER_TEMP/orangefox"/OrangeFox-*.img)
+          if [[ ! -s "$kernel" || ! -s "$kernel_dtb" ]]; then
+            echo "::error::Kernel artifact is missing Image.gz or mt6833.dtb."
+            exit 1
+          fi
+          if (( ${#fox_images[@]} != 1 )); then
+            echo "::error::Expected exactly one OrangeFox image; found ${#fox_images[@]}."
+            exit 1
+          fi
+          base_image="${fox_images[0]}"
+
+          tools="$RUNNER_TEMP/aosp-mkbootimg"
+          git init --quiet "$tools"
+          git -C "$tools" remote add origin https://android.googlesource.com/platform/system/tools/mkbootimg
+          git -C "$tools" fetch --depth=1 origin d2bb0af5ba6d3198a3e99529c97eda1be0b5a093
+          git -C "$tools" checkout --quiet --detach FETCH_HEAD
+          if [[ "$(git -C "$tools" rev-parse HEAD)" != "d2bb0af5ba6d3198a3e99529c97eda1be0b5a093" ]]; then
+            echo "::error::Fetched an unexpected AOSP mkbootimg revision."
+            exit 1
+          fi
+
+          mkdir -p "$RUNNER_TEMP/work" "$RUNNER_TEMP/output"
+          export BASE_IMAGE="$base_image"
+          export KERNEL_IMAGE="$kernel"
+          export KERNEL_DTB="$kernel_dtb"
+          export WORK_DIR="$RUNNER_TEMP/work"
+          export TOOLS_DIR="$tools"
+          export OUTPUT_DIR="$RUNNER_TEMP/output"
+          python3 - <<'PY'
+          import filecmp
+          import hashlib
+          import os
+          import pathlib
+          import shlex
+          import subprocess
+          import sys
+
+          base_image = pathlib.Path(os.environ["BASE_IMAGE"])
+          kernel_image = pathlib.Path(os.environ["KERNEL_IMAGE"])
+          kernel_dtb = pathlib.Path(os.environ["KERNEL_DTB"])
+          work_dir = pathlib.Path(os.environ["WORK_DIR"])
+          tools_dir = pathlib.Path(os.environ["TOOLS_DIR"])
+          output_dir = pathlib.Path(os.environ["OUTPUT_DIR"])
+          unpacker = tools_dir / "unpack_bootimg.py"
+          mkbootimg = tools_dir / "mkbootimg.py"
+          base_dir = work_dir / "base"
+          base_dir.mkdir(parents=True, exist_ok=True)
+
+          unpack = subprocess.run(
+              [sys.executable, str(unpacker), "--boot_img", str(base_image),
+               "--out", str(base_dir), "--format", "mkbootimg"],
+              check=True, capture_output=True, text=True)
+          args = shlex.split(unpack.stdout)
+          if not args or args[0] != "--header_version":
+              raise SystemExit("Could not parse boot image metadata from AOSP unpacker.")
+
+          def get_arg(option):
+              try:
+                  return args[args.index(option) + 1]
+              except (ValueError, IndexError) as exc:
+                  raise SystemExit(f"Missing {option} in boot image metadata.") from exc
+
+          if get_arg("--header_version") != "2":
+              raise SystemExit("Expected an Android boot image header version 2.")
+
+          dtb_image = (base_dir / "dtb").read_bytes()
+          dtb_bytes = kernel_dtb.read_bytes()
+          if (len(dtb_image) != len(dtb_bytes) + 64
+                  or dtb_image[:4] != bytes.fromhex("d7b7ab1e")
+                  or dtb_image[64:] != dtb_bytes
+                  or dtb_bytes[:4] != bytes.fromhex("d00dfeed")):
+              raise SystemExit("Kernel DTB does not match the OrangeFox MTK DTB image.")
+
+          def replace_arg(option, value):
+              try:
+                  index = args.index(option)
+                  args[index + 1] = str(value)
+              except (ValueError, IndexError) as exc:
+                  raise SystemExit(f"Missing {option} in boot image metadata.") from exc
+
+          replace_arg("--kernel", kernel_image)
+          replace_arg("--ramdisk", base_dir / "ramdisk")
+          replace_arg("--dtb", base_dir / "dtb")
+
+          image_name = (
+              f"OrangeFox-CustomKernel-evergo-{os.environ['KERNEL_SHA'][:12]}-"
+              f"{os.environ['FOX_SHA'][:12]}-boot.img")
+          output_image = output_dir / image_name
+          args.extend(["--output", str(output_image)])
+          subprocess.run([sys.executable, str(mkbootimg), *args], check=True)
+
+          partition_size = base_image.stat().st_size
+          if output_image.stat().st_size > partition_size:
+              raise SystemExit("Repacked boot image exceeds the OrangeFox image size.")
+          with output_image.open("r+b") as image_file:
+              image_file.truncate(partition_size)
+
+          verify_dir = work_dir / "verify"
+          subprocess.run(
+              [sys.executable, str(unpacker), "--boot_img", str(output_image),
+               "--out", str(verify_dir)],
+              check=True, capture_output=True, text=True)
+          components = [
+              ("kernel", verify_dir / "kernel", kernel_image),
+              ("ramdisk", verify_dir / "ramdisk", base_dir / "ramdisk"),
+              ("DTB", verify_dir / "dtb", base_dir / "dtb"),
+          ]
+          for name, actual, expected in components:
+              if not filecmp.cmp(actual, expected, shallow=False):
+                  raise SystemExit(f"Repacked {name} does not match its source.")
+
+          digest = hashlib.sha256()
+          with output_image.open("rb") as image_file:
+              for chunk in iter(lambda: image_file.read(1024 * 1024), b""):
+                  digest.update(chunk)
+          sha256 = digest.hexdigest()
+          (output_dir / f"{image_name}.sha256").write_text(
+              f"{sha256}  {image_name}\n", encoding="ascii")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as outputs:
+              outputs.write(f"image_name={image_name}\n")
+              outputs.write(f"sha256={sha256}\n")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+              summary.write("## evergo boot image\n\n")
+              summary.write(f"- Kernel run: `{os.environ['KERNEL_SHA']}`\n")
+              summary.write(f"- OrangeFox run: `{os.environ['FOX_SHA']}`\n")
+              summary.write(f"- Output: `{image_name}` ({partition_size} bytes)\n")
+              summary.write(f"- SHA-256: `{sha256}`\n")
+          PY
+
+      - name: Upload boot image
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: evergo-bootimg-${{ steps.select.outputs.kernel_sha }}-${{ steps.select.outputs.fox_sha }}
+          if-no-files-found: error
+          compression-level: 0
+          path: |
+            ${{ runner.temp }}/output/*.img
+            ${{ runner.temp }}/output/*.sha256

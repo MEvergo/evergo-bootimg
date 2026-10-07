@@ -28,23 +28,35 @@ jobs:
             echo "::error::Configure SOURCE_ARTIFACTS_TOKEN with Actions: read on both source repositories."
             exit 1
           fi
-          command -v gh >/dev/null
-          command -v jq >/dev/null
+          if ! command -v gh >/dev/null 2>&1; then
+            echo "::error::GitHub CLI (gh) is not installed or not on PATH on the self-hosted runner."
+            exit 1
+          fi
+          if ! command -v jq >/dev/null 2>&1; then
+            echo "::error::jq is not installed or not on PATH on the self-hosted runner."
+            exit 1
+          fi
 
-          kernel_runs=$(gh run list \
+          if ! kernel_runs=$(gh run list \
             --repo MEvergo/evergo-aqua-v34-port \
             --workflow 375622165 \
             --branch main \
             --status success \
             --limit 1 \
-            --json databaseId,headSha)
-          fox_runs=$(gh run list \
+            --json databaseId,headSha); then
+            echo "::error::Unable to list successful Kernel build runs. Check token access and gh CLI errors above."
+            exit 1
+          fi
+          if ! fox_runs=$(gh run list \
             --repo MEvergo/orangefox-evergo \
             --workflow 376503173 \
             --branch main \
             --status success \
             --limit 1 \
-            --json databaseId,headSha)
+            --json databaseId,headSha); then
+            echo "::error::Unable to list successful OrangeFox build runs. Check token access and gh CLI errors above."
+            exit 1
+          fi
 
           if [[ "$(jq 'length' <<< "$kernel_runs")" -eq 0 ]]; then
             echo "::error::No successful Kernel build run found on main."

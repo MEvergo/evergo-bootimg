@@ -32,8 +32,8 @@ jobs:
             echo "::error::GitHub CLI (gh) is not installed or not on PATH on the self-hosted runner."
             exit 1
           fi
-          if ! command -v jq >/dev/null 2>&1; then
-            echo "::error::jq is not installed or not on PATH on the self-hosted runner."
+          if ! command -v python3 >/dev/null 2>&1; then
+            echo "::error::Python 3 is not installed or not on PATH on the self-hosted runner."
             exit 1
           fi
 
@@ -58,24 +58,35 @@ jobs:
             exit 1
           fi
 
-          if [[ "$(jq 'length' <<< "$kernel_runs")" -eq 0 ]]; then
-            echo "::error::No successful Kernel build run found on main."
+          selected=$(python3 - "$kernel_runs" "$fox_runs" <<'PY'
+          import json
+          import re
+          import sys
+
+          for label, payload in (("Kernel", sys.argv[1]), ("OrangeFox", sys.argv[2])):
+              runs = json.loads(payload)
+              if not runs:
+                  raise SystemExit(f"No successful {label} build run found on main.")
+              run = runs[0]
+              run_id = run["databaseId"]
+              sha = run["headSha"]
+              if not isinstance(run_id, int) or run_id <= 0:
+                  raise SystemExit(f"Invalid {label} run ID: {run_id!r}")
+              if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{40}", sha):
+                  raise SystemExit(f"Invalid {label} head SHA: {sha!r}")
+              print(run_id)
+              print(sha)
+          PY
+          )
+          mapfile -t selected_values <<< "$selected"
+          if (( ${#selected_values[@]} != 4 )); then
+            echo "::error::Could not parse the latest successful upstream runs."
             exit 1
           fi
-          if [[ "$(jq 'length' <<< "$fox_runs")" -eq 0 ]]; then
-            echo "::error::No successful OrangeFox build run found on main."
-            exit 1
-          fi
-
-          kernel_run_id=$(jq -er '.[0].databaseId' <<< "$kernel_runs")
-          kernel_sha=$(jq -er '.[0].headSha' <<< "$kernel_runs")
-          fox_run_id=$(jq -er '.[0].databaseId' <<< "$fox_runs")
-          fox_sha=$(jq -er '.[0].headSha' <<< "$fox_runs")
-
-          [[ "$kernel_run_id" =~ ^[0-9]+$ ]]
-          [[ "$fox_run_id" =~ ^[0-9]+$ ]]
-          [[ "$kernel_sha" =~ ^[0-9a-f]{40}$ ]]
-          [[ "$fox_sha" =~ ^[0-9a-f]{40}$ ]]
+          kernel_run_id=${selected_values[0]}
+          kernel_sha=${selected_values[1]}
+          fox_run_id=${selected_values[2]}
+          fox_sha=${selected_values[3]}
 
           {
             echo "kernel_run_id=$kernel_run_id"
